@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from cache import events_cache, leagues_cache, make_key, odds_cache
-from config import DEFAULT_MARKETS, DEFAULT_REGIONS, SPORT_GROUPS
+from config import DEFAULT_MARKETS, DEFAULT_REGIONS, REGIONS_BY_SPORT, SPORT_GROUPS
 from odds_client import odds_api_get
 
 app = FastAPI(title="Odds Filter API", version="1.0.0")
@@ -173,7 +173,7 @@ async def get_odds(
     league: Optional[str] = Query(None, description="sport key especifico, ej soccer_epl"),
     event_id: Optional[str] = Query(None, description="id de un partido especifico"),
     markets: str = Query(DEFAULT_MARKETS, description="mercados separados por coma"),
-    regions: str = Query(DEFAULT_REGIONS, description="regiones de bookmakers separadas por coma"),
+    regions: Optional[str] = Query(None, description="regiones de bookmakers separadas por coma; si se omite, se usa la default segun el deporte"),
 ):
     """
     Endpoint principal: trae las cuotas para el deporte/liga/evento elegido
@@ -182,24 +182,33 @@ async def get_odds(
     if min_odds > max_odds:
         raise HTTPException(status_code=400, detail="min_odds no puede ser mayor que max_odds")
 
-    group = SPORT_GROUPS.get(sport.lower())
+    sport_key = sport.lower()
+    group = SPORT_GROUPS.get(sport_key)
     if not group:
         raise HTTPException(status_code=400, detail=f"Deporte invalido: {sport}")
+
+    # Si el usuario no manda regions explicitamente, usamos la mejor por defecto
+    # para ese deporte (evita el caso MLB/NBA con regiones europeas sin cobertura).
+    effective_regions = regions or REGIONS_BY_SPORT.get(sport_key, DEFAULT_REGIONS)
 
     leagues_to_query = [league] if league else [l["key"] for l in await get_leagues(sport)]
 
     results = []
     quota_info = {}
+    errors = []
     for league_key in leagues_to_query:
-        cache_key = make_key("odds", league_key, event_id, markets, regions)
+        cache_key = make_key("odds", league_key, event_id, markets, effective_regions)
         if cache_key in odds_cache:
             raw = odds_cache[cache_key]
         else:
             path = f"/sports/{league_key}/events/{event_id}/odds" if event_id else f"/sports/{league_key}/odds"
-            params = {"markets": markets, "regions": regions, "oddsFormat": "decimal"}
+            params = {"markets": markets, "regions": effective_regions, "oddsFormat": "decimal"}
             try:
                 raw, quota_info = await odds_api_get(path, params)
-            except HTTPException:
+            except HTTPException as e:
+                # Ya no lo escondemos: lo guardamos para poder diagnosticar
+                # por que una liga puntual no trajo nada (ej. mercado no soportado).
+                errors.append({"league": league_key, "status": e.status_code, "detail": e.detail})
                 continue
             # el endpoint de un solo evento devuelve un dict, no una lista
             raw = [raw] if isinstance(raw, dict) else raw
@@ -215,9 +224,10 @@ async def get_odds(
             "min_odds": min_odds,
             "max_odds": max_odds,
             "markets": markets,
-            "regions": regions,
+            "regions": effective_regions,
         },
         "quota": quota_info,
         "count": len(results),
         "events": results,
+        "errors": errors,
     }
