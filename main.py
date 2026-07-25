@@ -94,40 +94,64 @@ async def get_events(
     return all_events
 
 
-def _filter_outcomes_by_range(odds_response: list, min_odds: float, max_odds: float) -> list:
+# Un resultado se considera "valor" si la mejor cuota disponible supera el
+# promedio del mercado por al menos este porcentaje.
+VALUE_THRESHOLD_PCT = 3.0
+
+
+def _aggregate_and_filter_outcomes(odds_response: list, min_odds: float, max_odds: float) -> list:
     """
-    Recorre la respuesta cruda de The Odds API y deja solo los outcomes
-    (mercados/resultados) cuyo 'price' (cuota decimal) cae dentro del rango.
+    Recorre la respuesta cruda de The Odds API (que trae una casa de apuestas
+    por bloque, cada una con sus propios outcomes) y la colapsa en un solo
+    resultado por (mercado, nombre, punto), quedandose con la cuota MAS ALTA
+    entre todas las casas que la ofrecen. No exponemos el nombre de la casa
+    porque ninguna es colombiana; solo nos interesa el numero.
+
+    Tambien calculamos el promedio de esa cuota entre casas, para poder
+    marcar cuando la mejor cuota esta claramente por encima del promedio
+    (senal de "valor").
     """
     filtered_events = []
     for event in odds_response:
-        filtered_bookmakers = []
+        # market_key -> (name, point) -> lista de precios de todas las casas
+        markets_acc: dict[str, dict[tuple, list]] = {}
+
         for bookmaker in event.get("bookmakers", []):
-            filtered_markets = []
             for market in bookmaker.get("markets", []):
-                matching_outcomes = [
-                    outcome
-                    for outcome in market.get("outcomes", [])
-                    if outcome.get("price") is not None and min_odds <= outcome["price"] <= max_odds
-                ]
-                if matching_outcomes:
-                    filtered_markets.append(
-                        {
-                            "key": market["key"],
-                            "last_update": market.get("last_update"),
-                            "outcomes": matching_outcomes,
-                        }
-                    )
-            if filtered_markets:
-                filtered_bookmakers.append(
-                    {
-                        "key": bookmaker["key"],
-                        "title": bookmaker["title"],
-                        "last_update": bookmaker.get("last_update"),
-                        "markets": filtered_markets,
-                    }
-                )
-        if filtered_bookmakers:
+                market_key = market["key"]
+                markets_acc.setdefault(market_key, {})
+                for outcome in market.get("outcomes", []):
+                    price = outcome.get("price")
+                    if price is None:
+                        continue
+                    dedup_key = (outcome.get("name"), outcome.get("point"))
+                    markets_acc[market_key].setdefault(dedup_key, []).append(price)
+
+        result_markets = []
+        for market_key, outcomes_dict in markets_acc.items():
+            matching_outcomes = []
+            for (name, point), prices in outcomes_dict.items():
+                best_price = max(prices)
+                if not (min_odds <= best_price <= max_odds):
+                    continue
+                avg_price = sum(prices) / len(prices)
+                value_pct = ((best_price - avg_price) / avg_price * 100) if avg_price else 0.0
+                outcome_data = {
+                    "name": name,
+                    "price": round(best_price, 2),
+                    "avg_price": round(avg_price, 2),
+                    "bookmaker_count": len(prices),
+                    "is_value": value_pct >= VALUE_THRESHOLD_PCT,
+                }
+                if point is not None:
+                    outcome_data["point"] = point
+                matching_outcomes.append(outcome_data)
+
+            if matching_outcomes:
+                matching_outcomes.sort(key=lambda o: o["price"])
+                result_markets.append({"key": market_key, "outcomes": matching_outcomes})
+
+        if result_markets:
             filtered_events.append(
                 {
                     "id": event["id"],
@@ -135,7 +159,7 @@ def _filter_outcomes_by_range(odds_response: list, min_odds: float, max_odds: fl
                     "home_team": event.get("home_team"),
                     "away_team": event.get("away_team"),
                     "commence_time": event.get("commence_time"),
-                    "bookmakers": filtered_bookmakers,
+                    "markets": result_markets,
                 }
             )
     return filtered_events
@@ -181,7 +205,7 @@ async def get_odds(
             raw = [raw] if isinstance(raw, dict) else raw
             odds_cache[cache_key] = raw
 
-        results.extend(_filter_outcomes_by_range(raw, min_odds, max_odds))
+        results.extend(_aggregate_and_filter_outcomes(raw, min_odds, max_odds))
 
     return {
         "filters": {
