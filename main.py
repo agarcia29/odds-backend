@@ -4,7 +4,15 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from cache import events_cache, leagues_cache, make_key, odds_cache
-from config import DEFAULT_MARKETS, DEFAULT_REGIONS, REGIONS_BY_SPORT, SPORT_GROUPS
+from config import (
+    DEFAULT_MARKETS,
+    DEFAULT_REGIONS,
+    FEATURED_MARKETS,
+    PLAYER_MARKETS_BY_SPORT,
+    PLAYER_PROPS_REGIONS,
+    REGIONS_BY_SPORT,
+    SPORT_GROUPS,
+)
 from odds_client import odds_api_get
 
 app = FastAPI(title="Odds Filter API", version="1.0.0")
@@ -55,6 +63,19 @@ async def get_leagues(sport: str = Query(..., description="futbol | tenis | beis
     return leagues
 
 
+@app.get("/api/player-markets")
+async def get_player_markets(sport: str = Query(..., description="futbol | tenis | beisbol | basquetbol")):
+    """
+    Catalogo estatico de mercados de jugador soportados por deporte.
+    No llama a The Odds API (no consume cuota); es solo para poblar
+    los checkboxes de la app.
+    """
+    sport_key = sport.lower()
+    if sport_key not in SPORT_GROUPS:
+        raise HTTPException(status_code=400, detail=f"Deporte invalido: {sport}")
+    return PLAYER_MARKETS_BY_SPORT.get(sport_key, [])
+
+
 @app.get("/api/events")
 async def get_events(
     sport: str = Query(..., description="futbol | tenis | beisbol | basquetbol"),
@@ -103,9 +124,13 @@ def _aggregate_and_filter_outcomes(odds_response: list, min_odds: float, max_odd
     """
     Recorre la respuesta cruda de The Odds API (que trae una casa de apuestas
     por bloque, cada una con sus propios outcomes) y la colapsa en un solo
-    resultado por (mercado, nombre, punto), quedandose con la cuota MAS ALTA
-    entre todas las casas que la ofrecen. No exponemos el nombre de la casa
-    porque ninguna es colombiana; solo nos interesa el numero.
+    resultado por (mercado, nombre, jugador, punto), quedandose con la cuota
+    MAS ALTA entre todas las casas que la ofrecen. No exponemos el nombre de
+    la casa porque ninguna es colombiana; solo nos interesa el numero.
+
+    Para mercados de jugador, The Odds API manda el nombre del jugador en
+    el campo "description" (name sigue siendo "Over"/"Under"), por eso
+    se incluye en la clave de deduplicacion y se expone como "player".
 
     Tambien calculamos el promedio de esa cuota entre casas, para poder
     marcar cuando la mejor cuota esta claramente por encima del promedio
@@ -113,7 +138,7 @@ def _aggregate_and_filter_outcomes(odds_response: list, min_odds: float, max_odd
     """
     filtered_events = []
     for event in odds_response:
-        # market_key -> (name, point) -> lista de precios de todas las casas
+        # market_key -> (name, description, point) -> lista de precios de todas las casas
         markets_acc: dict[str, dict[tuple, list]] = {}
 
         for bookmaker in event.get("bookmakers", []):
@@ -124,13 +149,13 @@ def _aggregate_and_filter_outcomes(odds_response: list, min_odds: float, max_odd
                     price = outcome.get("price")
                     if price is None:
                         continue
-                    dedup_key = (outcome.get("name"), outcome.get("point"))
+                    dedup_key = (outcome.get("name"), outcome.get("description"), outcome.get("point"))
                     markets_acc[market_key].setdefault(dedup_key, []).append(price)
 
         result_markets = []
         for market_key, outcomes_dict in markets_acc.items():
             matching_outcomes = []
-            for (name, point), prices in outcomes_dict.items():
+            for (name, description, point), prices in outcomes_dict.items():
                 best_price = max(prices)
                 if not (min_odds <= best_price <= max_odds):
                     continue
@@ -145,6 +170,8 @@ def _aggregate_and_filter_outcomes(odds_response: list, min_odds: float, max_odd
                 }
                 if point is not None:
                     outcome_data["point"] = point
+                if description is not None:
+                    outcome_data["player"] = description
                 matching_outcomes.append(outcome_data)
 
             if matching_outcomes:
@@ -187,9 +214,24 @@ async def get_odds(
     if not group:
         raise HTTPException(status_code=400, detail=f"Deporte invalido: {sport}")
 
+    requested_markets = [m.strip() for m in markets.split(",") if m.strip()]
+    has_player_or_additional_markets = any(m not in FEATURED_MARKETS for m in requested_markets)
+
+    if has_player_or_additional_markets and not event_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Los mercados de jugador (o adicionales) solo se pueden pedir eligiendo un evento especifico.",
+        )
+
     # Si el usuario no manda regions explicitamente, usamos la mejor por defecto
     # para ese deporte (evita el caso MLB/NBA con regiones europeas sin cobertura).
-    effective_regions = regions or REGIONS_BY_SPORT.get(sport_key, DEFAULT_REGIONS)
+    # Los mercados de jugador casi solo tienen cobertura de casas americanas.
+    if regions:
+        effective_regions = regions
+    elif has_player_or_additional_markets:
+        effective_regions = PLAYER_PROPS_REGIONS
+    else:
+        effective_regions = REGIONS_BY_SPORT.get(sport_key, DEFAULT_REGIONS)
 
     leagues_to_query = [league] if league else [l["key"] for l in await get_leagues(sport)]
 
