@@ -73,6 +73,21 @@ PLAYER_MARKETS_BY_SPORT = {
 # "adicional" (incluye player props) y solo funciona pidiendo un evento puntual.
 FEATURED_MARKETS = {"h2h", "spreads", "totals"}
 
+# Mercados adicionales A NIVEL DE PARTIDO (no de jugador puntual). Por ahora
+# The Odds API solo los soporta bien para futbol. NOTA: corners (tiros de
+# esquina) NO esta disponible en esta API todavia, solo en otras de la
+# competencia — no se puede ofrecer aunque se pidio.
+MATCH_MARKETS_BY_SPORT = {
+    "futbol": [
+        {"key": "btts", "label": "Ambos equipos anotan"},
+        {"key": "double_chance", "label": "Doble oportunidad"},
+        {"key": "draw_no_bet", "label": "Empate anula (Draw No Bet)"},
+    ],
+    "basquetbol": [],
+    "beisbol": [],
+    "tenis": [],
+}
+
 # Regiones a forzar cuando se piden mercados de jugador, porque casi no
 # hay cobertura fuera de casas americanas.
 PLAYER_PROPS_REGIONS = "us,us2"

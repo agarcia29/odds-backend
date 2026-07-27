@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -8,12 +9,25 @@ from config import (
     DEFAULT_MARKETS,
     DEFAULT_REGIONS,
     FEATURED_MARKETS,
+    MATCH_MARKETS_BY_SPORT,
     PLAYER_MARKETS_BY_SPORT,
     PLAYER_PROPS_REGIONS,
     REGIONS_BY_SPORT,
     SPORT_GROUPS,
 )
 from odds_client import odds_api_get
+
+# Colombia no tiene horario de verano, siempre UTC-5. Se usa para decidir
+# que partido cuenta como "de hoy" al filtrar eventos.
+COLOMBIA_TZ = timezone(timedelta(hours=-5))
+
+
+def _is_today_in_colombia(commence_time_iso: str) -> bool:
+    event_dt = datetime.fromisoformat(commence_time_iso.replace("Z", "+00:00"))
+    event_date_co = event_dt.astimezone(COLOMBIA_TZ).date()
+    today_co = datetime.now(COLOMBIA_TZ).date()
+    return event_date_co == today_co
+
 
 app = FastAPI(title="Odds Filter API", version="1.0.0")
 
@@ -63,27 +77,36 @@ async def get_leagues(sport: str = Query(..., description="futbol | tenis | beis
     return leagues
 
 
-@app.get("/api/player-markets")
-async def get_player_markets(sport: str = Query(..., description="futbol | tenis | beisbol | basquetbol")):
+@app.get("/api/extra-markets")
+async def get_extra_markets(sport: str = Query(..., description="futbol | tenis | beisbol | basquetbol")):
     """
-    Catalogo estatico de mercados de jugador soportados por deporte.
-    No llama a The Odds API (no consume cuota); es solo para poblar
-    los checkboxes de la app.
+    Catalogo estatico de mercados "adicionales" soportados por deporte,
+    separados en dos categorias:
+      - player_markets: props de jugador (ej. puntos, goles, hits)
+      - match_markets: del partido pero fuera de h2h/spreads/totals (ej. BTTS)
+    Todos requieren event_id (no se pueden pedir en bloque). No llama a
+    The Odds API (no consume cuota); es solo para poblar los checkboxes.
     """
     sport_key = sport.lower()
     if sport_key not in SPORT_GROUPS:
         raise HTTPException(status_code=400, detail=f"Deporte invalido: {sport}")
-    return PLAYER_MARKETS_BY_SPORT.get(sport_key, [])
+    return {
+        "player_markets": PLAYER_MARKETS_BY_SPORT.get(sport_key, []),
+        "match_markets": MATCH_MARKETS_BY_SPORT.get(sport_key, []),
+    }
 
 
 @app.get("/api/events")
 async def get_events(
     sport: str = Query(..., description="futbol | tenis | beisbol | basquetbol"),
     league: Optional[str] = Query(None, description="sport key especifico, ej soccer_epl"),
+    only_today: bool = Query(True, description="si es true (default), solo devuelve partidos de hoy en hora Colombia"),
 ):
     """
     Devuelve los eventos (partidos) disponibles. Si no se pasa 'league',
     junta los eventos de todas las ligas del deporte elegido.
+    Por defecto solo devuelve los partidos del dia de hoy (hora Colombia,
+    UTC-5); manda only_today=false para ver todo el calendario disponible.
     Este endpoint no consume cuota de la API (es gratis).
     """
     leagues_to_query = [league] if league else [l["key"] for l in await get_leagues(sport)]
@@ -102,6 +125,8 @@ async def get_events(
             events_cache[cache_key] = events
 
         for e in events:
+            if only_today and not _is_today_in_colombia(e["commence_time"]):
+                continue
             all_events.append(
                 {
                     "id": e["id"],
