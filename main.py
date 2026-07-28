@@ -72,14 +72,27 @@ async def debug_balldontlie(
     result["teams_call_worked"] = teams_data is not None
     result["teams_sample"] = teams_data
 
+    team_id_found = None
     if team:
-        result["team_id_found"] = await find_team_id(prefix, team)
+        team_id_found = await find_team_id(prefix, team)
+        result["team_id_found"] = team_id_found
 
     if player:
-        p = await find_player_id(prefix, player)
+        # Busqueda cruda (todos los candidatos) para poder ver que trae balldontlie
+        raw_search = await bdl_get(f"/{prefix}/v1/players", {"search": player.split(" ")[-1], "per_page": 25})
+        result["player_search_candidates"] = [
+            {"id": c.get("id"), "name": f"{c.get('first_name')} {c.get('last_name')}", "team": c.get("team")}
+            for c in (raw_search or {}).get("data", [])
+        ]
+
+        p = await find_player_id(prefix, player, team_id_found)
         result["player_found"] = p
         if p and p.get("id"):
             seasons = [datetime.now().year, datetime.now().year - 1]
+            raw_stats = await bdl_get(
+                f"/{prefix}/v1/stats", {"player_ids[]": p["id"], "seasons[]": seasons, "per_page": 5}
+            )
+            result["raw_stats_response"] = raw_stats
             stats = await get_player_recent_stats(prefix, p["id"], seasons)
             result["stats_sample_first_game"] = stats[0] if stats else None
             result["stats_sample_count"] = len(stats)
