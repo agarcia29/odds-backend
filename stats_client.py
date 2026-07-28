@@ -24,6 +24,29 @@ async def bdl_get(path: str, params: dict) -> dict | None:
         return None
 
 
+async def bdl_get_debug(path: str, params: dict) -> dict:
+    """
+    Igual que bdl_get pero SIN tragarse el error -- devuelve status_code
+    y el cuerpo crudo de la respuesta para poder diagnosticar por que
+    fallo una llamada (403 de plan, 404 de endpoint, 400 de parametros, etc).
+    Solo se usa desde /api/debug/balldontlie.
+    """
+    if not BALLDONTLIE_API_KEY:
+        return {"error": "BALLDONTLIE_API_KEY no configurada"}
+    url = f"{BALLDONTLIE_BASE}{path}"
+    headers = {"Authorization": BALLDONTLIE_API_KEY}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params=params, headers=headers)
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text
+        return {"status_code": resp.status_code, "body": body}
+    except httpx.HTTPError as e:
+        return {"error": str(e)}
+
+
 def _normalize(name: str) -> str:
     return name.strip().lower()
 

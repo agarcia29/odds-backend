@@ -20,7 +20,7 @@ from config import (
     SPORT_GROUPS,
 )
 from odds_client import odds_api_get
-from stats_client import bdl_get, find_player_id, find_team_id, get_player_recent_stats
+from stats_client import bdl_get, bdl_get_debug, find_player_id, find_team_id, get_player_recent_stats
 from insights import build_player_insights
 
 # Colombia no tiene horario de verano, siempre UTC-5. Se usa para decidir
@@ -89,10 +89,10 @@ async def debug_balldontlie(
         result["player_found"] = p
         if p and p.get("id"):
             seasons = [datetime.now().year, datetime.now().year - 1]
-            raw_stats = await bdl_get(
+            debug_stats = await bdl_get_debug(
                 f"/{prefix}/v1/stats", {"player_ids[]": p["id"], "seasons[]": seasons, "per_page": 5}
             )
-            result["raw_stats_response"] = raw_stats
+            result["raw_stats_response_debug"] = debug_stats
             stats = await get_player_recent_stats(prefix, p["id"], seasons)
             result["stats_sample_first_game"] = stats[0] if stats else None
             result["stats_sample_count"] = len(stats)
