@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from cache import events_cache, leagues_cache, make_key, odds_cache
 from config import (
+    BALLDONTLIE_API_KEY,
     BDL_SPORT_PREFIX,
     DEFAULT_MARKETS,
     DEFAULT_REGIONS,
@@ -19,7 +20,7 @@ from config import (
     SPORT_GROUPS,
 )
 from odds_client import odds_api_get
-from stats_client import find_player_id, find_team_id, get_player_recent_stats
+from stats_client import bdl_get, find_player_id, find_team_id, get_player_recent_stats
 from insights import build_player_insights
 
 # Colombia no tiene horario de verano, siempre UTC-5. Se usa para decidir
@@ -47,6 +48,43 @@ app.add_middleware(
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/debug/balldontlie")
+async def debug_balldontlie(
+    sport: str = Query(..., description="beisbol | basquetbol"),
+    team: Optional[str] = Query(None, description="nombre de equipo a probar, ej 'New York Mets'"),
+    player: Optional[str] = Query(None, description="nombre/apellido de jugador a probar, ej 'Scott'"),
+):
+    """
+    Endpoint de diagnostico (no lo usa la app, es para ti/nosotros).
+    Te dice: si la key esta configurada, si balldontlie responde, y te
+    muestra el JSON crudo para poder confirmar los nombres de campo reales.
+    Ejemplo: /api/debug/balldontlie?sport=beisbol&team=New York Mets&player=Scott
+    """
+    prefix = BDL_SPORT_PREFIX.get(sport.lower())
+    if not prefix:
+        raise HTTPException(status_code=400, detail=f"Deporte no soportado para stats todavia: {sport}")
+
+    result = {"key_configured": bool(BALLDONTLIE_API_KEY), "sport_prefix": prefix}
+
+    teams_data = await bdl_get(f"/{prefix}/v1/teams", {"per_page": 3})
+    result["teams_call_worked"] = teams_data is not None
+    result["teams_sample"] = teams_data
+
+    if team:
+        result["team_id_found"] = await find_team_id(prefix, team)
+
+    if player:
+        p = await find_player_id(prefix, player)
+        result["player_found"] = p
+        if p and p.get("id"):
+            seasons = [datetime.now().year, datetime.now().year - 1]
+            stats = await get_player_recent_stats(prefix, p["id"], seasons)
+            result["stats_sample_first_game"] = stats[0] if stats else None
+            result["stats_sample_count"] = len(stats)
+
+    return result
 
 
 @app.get("/api/sports")
@@ -361,4 +399,5 @@ async def get_odds(
         "count": len(results),
         "events": results,
         "errors": errors,
+        "insights_enabled": bool(BALLDONTLIE_API_KEY),
     }
