@@ -6,6 +6,44 @@ load_dotenv()
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
+# --- balldontlie (estadisticas historicas para calcular % de acierto) ---
+BALLDONTLIE_API_KEY = os.getenv("BALLDONTLIE_API_KEY", "")
+BALLDONTLIE_BASE = "https://api.balldontlie.io"
+
+# Prefijo de URL de balldontlie por deporte. Empezamos solo con beisbol
+# (coincide con el ejemplo que nos diste) y basquetbol; futbol/tenis se
+# agregan despues siguiendo el mismo patron.
+BDL_SPORT_PREFIX = {
+    "beisbol": "mlb",
+    "basquetbol": "nba",
+}
+
+# Cuantos partidos recientes mirar para calcular el % de acierto.
+INSIGHTS_LAST_N_GAMES = 10
+
+# OJO - PENDIENTE DE VERIFICAR CON DATOS REALES:
+# Estos son los nombres de campo que balldontlie normalmente usa en su
+# respuesta de estadisticas por partido, pero no se pudieron confirmar
+# 100% sin hacer una llamada real con API key. En cuanto Andres tenga
+# su key, hacemos una llamada de prueba y ajustamos esto si hace falta.
+MARKET_STAT_FIELDS = {
+    "beisbol": {
+        "batter_hits": "hits",
+        "batter_home_runs": "home_runs",
+        "batter_rbis": "rbi",
+        "pitcher_strikeouts": "strikeouts",
+    },
+    "basquetbol": {
+        "player_points": "pts",
+        "player_rebounds": "reb",
+        "player_assists": "ast",
+        "player_threes": "fg3m",
+        "player_blocks": "blk",
+        "player_steals": "stl",
+    },
+}
+
+
 # Mapeo de "deporte" (como lo elige el usuario en la app) al campo "group"
 # que devuelve The Odds API en GET /v4/sports. Esto permite mostrar 4
 # botones simples (Futbol, Tenis, Beisbol, Basquetbol) y por debajo

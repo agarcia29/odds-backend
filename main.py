@@ -6,9 +6,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from cache import events_cache, leagues_cache, make_key, odds_cache
 from config import (
+    BDL_SPORT_PREFIX,
     DEFAULT_MARKETS,
     DEFAULT_REGIONS,
     FEATURED_MARKETS,
+    INSIGHTS_LAST_N_GAMES,
+    MARKET_STAT_FIELDS,
     MATCH_MARKETS_BY_SPORT,
     PLAYER_MARKETS_BY_SPORT,
     PLAYER_PROPS_REGIONS,
@@ -16,6 +19,8 @@ from config import (
     SPORT_GROUPS,
 )
 from odds_client import odds_api_get
+from stats_client import find_player_id, find_team_id, get_player_recent_stats
+from insights import build_player_insights
 
 # Colombia no tiene horario de verano, siempre UTC-5. Se usa para decidir
 # que partido cuenta como "de hoy" al filtrar eventos.
@@ -217,6 +222,57 @@ def _aggregate_and_filter_outcomes(odds_response: list, min_odds: float, max_odd
     return filtered_events
 
 
+async def _enrich_events_with_player_insights(sport_key: str, events: list) -> None:
+    """
+    Le agrega a cada outcome de mercado de jugador un campo "insights" con
+    el % de acierto historico (usa balldontlie). Modifica 'events' in-place.
+    Si algo falla (sin API key, jugador no encontrado, etc.) simplemente
+    no agrega insights a ese outcome -- nunca rompe la respuesta principal.
+    """
+    prefix = BDL_SPORT_PREFIX.get(sport_key)
+    stat_fields = MARKET_STAT_FIELDS.get(sport_key, {})
+    if not prefix or not stat_fields:
+        return
+
+    current_year = datetime.now().year
+    seasons = [current_year, current_year - 1]
+
+    for event in events:
+        home_team_id = await find_team_id(prefix, event.get("home_team", ""))
+        away_team_id = await find_team_id(prefix, event.get("away_team", ""))
+
+        for market in event.get("markets", []):
+            stat_field = stat_fields.get(market["key"])
+            if not stat_field:
+                continue
+
+            for outcome in market.get("outcomes", []):
+                player_name = outcome.get("player")
+                point = outcome.get("point")
+                if not player_name or point is None:
+                    continue
+
+                try:
+                    player = await find_player_id(prefix, player_name, home_team_id) or await find_player_id(
+                        prefix, player_name, away_team_id
+                    )
+                    if not player or not player.get("id"):
+                        continue
+
+                    opponent_id = away_team_id if player.get("team_id") == home_team_id else home_team_id
+                    logs = await get_player_recent_stats(prefix, player["id"], seasons)
+                    over = outcome.get("name") == "Over"
+                    insights = build_player_insights(
+                        logs, stat_field, point, over, opponent_id, INSIGHTS_LAST_N_GAMES
+                    )
+                    if insights:
+                        outcome["insights"] = insights
+                except Exception:
+                    # Best-effort: si balldontlie falla para este jugador puntual,
+                    # seguimos con el resto sin tumbar toda la respuesta.
+                    continue
+
+
 @app.get("/api/odds")
 async def get_odds(
     sport: str = Query(..., description="futbol | tenis | beisbol | basquetbol"),
@@ -282,6 +338,14 @@ async def get_odds(
             odds_cache[cache_key] = raw
 
         results.extend(_aggregate_and_filter_outcomes(raw, min_odds, max_odds))
+
+    # Insights de % de acierto historico (best-effort, solo si hay
+    # balldontlie configurado y es un deporte soportado por ahora).
+    if event_id and sport_key in BDL_SPORT_PREFIX:
+        try:
+            await _enrich_events_with_player_insights(sport_key, results)
+        except Exception:
+            pass
 
     return {
         "filters": {
