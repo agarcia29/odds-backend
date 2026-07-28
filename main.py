@@ -6,21 +6,19 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from cache import events_cache, leagues_cache, make_key, odds_cache
 from config import (
-    BALLDONTLIE_API_KEY,
-    BDL_SPORT_PREFIX,
     DEFAULT_MARKETS,
     DEFAULT_REGIONS,
     FEATURED_MARKETS,
     INSIGHTS_LAST_N_GAMES,
-    MARKET_STAT_FIELDS,
     MATCH_MARKETS_BY_SPORT,
+    MLB_MARKET_STAT_FIELDS,
     PLAYER_MARKETS_BY_SPORT,
     PLAYER_PROPS_REGIONS,
     REGIONS_BY_SPORT,
     SPORT_GROUPS,
 )
 from odds_client import odds_api_get
-from stats_client import bdl_get, bdl_get_debug, find_player_id, find_team_id, get_player_recent_stats
+from mlb_stats_client import find_mlb_player_id, find_mlb_team_id, get_player_game_log
 from insights import build_player_insights
 
 # Colombia no tiene horario de verano, siempre UTC-5. Se usa para decidir
@@ -50,52 +48,37 @@ async def health():
     return {"status": "ok"}
 
 
-@app.get("/api/debug/balldontlie")
-async def debug_balldontlie(
-    sport: str = Query(..., description="beisbol | basquetbol"),
-    team: Optional[str] = Query(None, description="nombre de equipo a probar, ej 'New York Mets'"),
+@app.get("/api/debug/mlb-stats")
+async def debug_mlb_stats(
+    team: str = Query(..., description="nombre de equipo, ej 'New York Mets'"),
     player: Optional[str] = Query(None, description="nombre/apellido de jugador a probar, ej 'Scott'"),
+    market: str = Query("pitcher_strikeouts", description="market key para elegir grupo/campo de stat"),
 ):
     """
-    Endpoint de diagnostico (no lo usa la app, es para ti/nosotros).
-    Te dice: si la key esta configurada, si balldontlie responde, y te
-    muestra el JSON crudo para poder confirmar los nombres de campo reales.
-    Ejemplo: /api/debug/balldontlie?sport=beisbol&team=New York Mets&player=Scott
+    Endpoint de diagnostico (no lo usa la app). Prueba la MLB Stats API
+    en vivo: busca el equipo, busca al jugador en SU roster, y trae su
+    log de partidos para el mercado indicado.
+    Ejemplo: /api/debug/mlb-stats?team=New York Mets&player=Scott&market=pitcher_strikeouts
     """
-    prefix = BDL_SPORT_PREFIX.get(sport.lower())
-    if not prefix:
-        raise HTTPException(status_code=400, detail=f"Deporte no soportado para stats todavia: {sport}")
+    result = {}
 
-    result = {"key_configured": bool(BALLDONTLIE_API_KEY), "sport_prefix": prefix}
-
-    teams_data = await bdl_get(f"/{prefix}/v1/teams", {"per_page": 3})
-    result["teams_call_worked"] = teams_data is not None
-    result["teams_sample"] = teams_data
-
-    team_id_found = None
-    if team:
-        team_id_found = await find_team_id(prefix, team)
-        result["team_id_found"] = team_id_found
+    team_id = await find_mlb_team_id(team)
+    result["team_id_found"] = team_id
+    if not team_id:
+        return result
 
     if player:
-        # Busqueda cruda (todos los candidatos) para poder ver que trae balldontlie
-        raw_search = await bdl_get(f"/{prefix}/v1/players", {"search": player.split(" ")[-1], "per_page": 25})
-        result["player_search_candidates"] = [
-            {"id": c.get("id"), "name": f"{c.get('first_name')} {c.get('last_name')}", "team": c.get("team")}
-            for c in (raw_search or {}).get("data", [])
-        ]
-
-        p = await find_player_id(prefix, player, team_id_found)
-        result["player_found"] = p
-        if p and p.get("id"):
-            seasons = [datetime.now().year, datetime.now().year - 1]
-            debug_stats = await bdl_get_debug(
-                f"/{prefix}/v1/stats", {"player_ids[]": p["id"], "seasons[]": seasons, "per_page": 5}
-            )
-            result["raw_stats_response_debug"] = debug_stats
-            stats = await get_player_recent_stats(prefix, p["id"], seasons)
-            result["stats_sample_first_game"] = stats[0] if stats else None
-            result["stats_sample_count"] = len(stats)
+        player_id = await find_mlb_player_id(team_id, player)
+        result["player_id_found"] = player_id
+        if player_id:
+            group, stat_field = MLB_MARKET_STAT_FIELDS.get(market, (None, None))
+            result["stat_group"] = group
+            result["stat_field"] = stat_field
+            if group:
+                seasons = [datetime.now().year, datetime.now().year - 1]
+                log = await get_player_game_log(player_id, group, seasons, stat_field)
+                result["game_log_count"] = len(log)
+                result["game_log_sample"] = log[:5]
 
     return result
 
@@ -276,26 +259,26 @@ def _aggregate_and_filter_outcomes(odds_response: list, min_odds: float, max_odd
 async def _enrich_events_with_player_insights(sport_key: str, events: list) -> None:
     """
     Le agrega a cada outcome de mercado de jugador un campo "insights" con
-    el % de acierto historico (usa balldontlie). Modifica 'events' in-place.
-    Si algo falla (sin API key, jugador no encontrado, etc.) simplemente
-    no agrega insights a ese outcome -- nunca rompe la respuesta principal.
+    el % de acierto historico. Por ahora solo beisbol (MLB Stats API,
+    gratis y oficial). Modifica 'events' in-place. Si algo falla (jugador
+    no encontrado, etc.) simplemente no agrega insights a ese outcome --
+    nunca rompe la respuesta principal.
     """
-    prefix = BDL_SPORT_PREFIX.get(sport_key)
-    stat_fields = MARKET_STAT_FIELDS.get(sport_key, {})
-    if not prefix or not stat_fields:
+    if sport_key != "beisbol":
         return
 
     current_year = datetime.now().year
     seasons = [current_year, current_year - 1]
 
     for event in events:
-        home_team_id = await find_team_id(prefix, event.get("home_team", ""))
-        away_team_id = await find_team_id(prefix, event.get("away_team", ""))
+        home_team_id = await find_mlb_team_id(event.get("home_team", ""))
+        away_team_id = await find_mlb_team_id(event.get("away_team", ""))
 
         for market in event.get("markets", []):
-            stat_field = stat_fields.get(market["key"])
-            if not stat_field:
+            stat_config = MLB_MARKET_STAT_FIELDS.get(market["key"])
+            if not stat_config:
                 continue
+            group, stat_field = stat_config
 
             for outcome in market.get("outcomes", []):
                 player_name = outcome.get("player")
@@ -304,22 +287,28 @@ async def _enrich_events_with_player_insights(sport_key: str, events: list) -> N
                     continue
 
                 try:
-                    player = await find_player_id(prefix, player_name, home_team_id) or await find_player_id(
-                        prefix, player_name, away_team_id
-                    )
-                    if not player or not player.get("id"):
+                    # Buscamos primero en el roster del equipo de casa, luego el de visita
+                    player_id = None
+                    player_team_id = None
+                    if home_team_id:
+                        player_id = await find_mlb_player_id(home_team_id, player_name)
+                        if player_id:
+                            player_team_id = home_team_id
+                    if not player_id and away_team_id:
+                        player_id = await find_mlb_player_id(away_team_id, player_name)
+                        if player_id:
+                            player_team_id = away_team_id
+                    if not player_id:
                         continue
 
-                    opponent_id = away_team_id if player.get("team_id") == home_team_id else home_team_id
-                    logs = await get_player_recent_stats(prefix, player["id"], seasons)
+                    opponent_id = away_team_id if player_team_id == home_team_id else home_team_id
+                    log = await get_player_game_log(player_id, group, seasons, stat_field)
                     over = outcome.get("name") == "Over"
-                    insights = build_player_insights(
-                        logs, stat_field, point, over, opponent_id, INSIGHTS_LAST_N_GAMES
-                    )
+                    insights = build_player_insights(log, point, over, opponent_id, INSIGHTS_LAST_N_GAMES)
                     if insights:
                         outcome["insights"] = insights
                 except Exception:
-                    # Best-effort: si balldontlie falla para este jugador puntual,
+                    # Best-effort: si la MLB Stats API falla para este jugador puntual,
                     # seguimos con el resto sin tumbar toda la respuesta.
                     continue
 
@@ -392,7 +381,7 @@ async def get_odds(
 
     # Insights de % de acierto historico (best-effort, solo si hay
     # balldontlie configurado y es un deporte soportado por ahora).
-    if event_id and sport_key in BDL_SPORT_PREFIX:
+    if event_id and sport_key == "beisbol":
         try:
             await _enrich_events_with_player_insights(sport_key, results)
         except Exception:
@@ -412,5 +401,5 @@ async def get_odds(
         "count": len(results),
         "events": results,
         "errors": errors,
-        "insights_enabled": bool(BALLDONTLIE_API_KEY),
+        "insights_enabled": sport_key == "beisbol",
     }

@@ -6,41 +6,24 @@ load_dotenv()
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
-# --- balldontlie (estadisticas historicas para calcular % de acierto) ---
-BALLDONTLIE_API_KEY = os.getenv("BALLDONTLIE_API_KEY", "")
-BALLDONTLIE_BASE = "https://api.balldontlie.io"
-
-# Prefijo de URL de balldontlie por deporte. Empezamos solo con beisbol
-# (coincide con el ejemplo que nos diste) y basquetbol; futbol/tenis se
-# agregan despues siguiendo el mismo patron.
-BDL_SPORT_PREFIX = {
-    "beisbol": "mlb",
-    "basquetbol": "nba",
-}
+# --- Estadisticas historicas para calcular % de acierto ---
+# Beisbol usa la API oficial y gratuita de MLB (statsapi.mlb.com, sin key).
+# Basquetbol (NBA) queda PENDIENTE: la unica fuente que teniamos (balldontlie)
+# bloquea el historial de stats por partido en el plan Free (confirmado con
+# un 401 en las pruebas) -- se agrega cuando haya presupuesto o aparezca
+# otra fuente gratis confiable.
 
 # Cuantos partidos recientes mirar para calcular el % de acierto.
 INSIGHTS_LAST_N_GAMES = 10
 
-# OJO - PENDIENTE DE VERIFICAR CON DATOS REALES:
-# Estos son los nombres de campo que balldontlie normalmente usa en su
-# respuesta de estadisticas por partido, pero no se pudieron confirmar
-# 100% sin hacer una llamada real con API key. En cuanto Andres tenga
-# su key, hacemos una llamada de prueba y ajustamos esto si hace falta.
-MARKET_STAT_FIELDS = {
-    "beisbol": {
-        "batter_hits": "hits",
-        "batter_home_runs": "home_runs",
-        "batter_rbis": "rbi",
-        "pitcher_strikeouts": "strikeouts",
-    },
-    "basquetbol": {
-        "player_points": "pts",
-        "player_rebounds": "reb",
-        "player_assists": "ast",
-        "player_threes": "fg3m",
-        "player_blocks": "blk",
-        "player_steals": "stl",
-    },
+# market_key -> (grupo de stats "hitting"/"pitching", nombre del campo)
+# Estos SI estan confirmados contra la MLB Stats API real (es una API
+# publica muy estable y documentada desde hace años).
+MLB_MARKET_STAT_FIELDS = {
+    "batter_hits": ("hitting", "hits"),
+    "batter_home_runs": ("hitting", "homeRuns"),
+    "batter_rbis": ("hitting", "rbi"),
+    "pitcher_strikeouts": ("pitching", "strikeOuts"),
 }
 
 
