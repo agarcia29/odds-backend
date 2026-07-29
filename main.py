@@ -9,7 +9,6 @@ from config import (
     DEFAULT_MARKETS,
     DEFAULT_REGIONS,
     FEATURED_MARKETS,
-    INSIGHTS_LAST_N_GAMES,
     MATCH_MARKETS_BY_SPORT,
     MLB_MARKET_STAT_FIELDS,
     PLAYER_MARKETS_BY_SPORT,
@@ -19,7 +18,7 @@ from config import (
 )
 from odds_client import odds_api_get
 from mlb_stats_client import find_mlb_player_id, find_mlb_team_id, get_player_game_log
-from insights import build_player_insights
+from insights import best_pct, build_player_insights
 
 # Colombia no tiene horario de verano, siempre UTC-5. Se usa para decidir
 # que partido cuenta como "de hoy" al filtrar eventos.
@@ -304,7 +303,7 @@ async def _enrich_events_with_player_insights(sport_key: str, events: list) -> N
                     opponent_id = away_team_id if player_team_id == home_team_id else home_team_id
                     log = await get_player_game_log(player_id, group, seasons, stat_field)
                     over = outcome.get("name") == "Over"
-                    insights = build_player_insights(log, point, over, opponent_id, INSIGHTS_LAST_N_GAMES)
+                    insights = build_player_insights(log, point, over, opponent_id)
                     if insights:
                         outcome["insights"] = insights
                 except Exception:
@@ -322,6 +321,10 @@ async def get_odds(
     event_id: Optional[str] = Query(None, description="id de un partido especifico"),
     markets: str = Query(DEFAULT_MARKETS, description="mercados separados por coma"),
     regions: Optional[str] = Query(None, description="regiones de bookmakers separadas por coma; si se omite, se usa la default segun el deporte"),
+    min_hit_pct: Optional[float] = Query(
+        75.0, ge=0, le=100, description="oculta outcomes con insights por debajo de este % de acierto (solo aplica si hay insights)"
+    ),
+    over_under: str = Query("both", description="'over', 'under' o 'both' -- filtra outcomes Over/Under"),
 ):
     """
     Endpoint principal: trae las cuotas para el deporte/liga/evento elegido
@@ -334,6 +337,10 @@ async def get_odds(
     group = SPORT_GROUPS.get(sport_key)
     if not group:
         raise HTTPException(status_code=400, detail=f"Deporte invalido: {sport}")
+
+    over_under_norm = over_under.lower().strip()
+    if over_under_norm not in ("over", "under", "both"):
+        raise HTTPException(status_code=400, detail="over_under debe ser 'over', 'under' o 'both'")
 
     requested_markets = [m.strip() for m in markets.split(",") if m.strip()]
     has_player_or_additional_markets = any(m not in FEATURED_MARKETS for m in requested_markets)
@@ -379,13 +386,51 @@ async def get_odds(
 
         results.extend(_aggregate_and_filter_outcomes(raw, min_odds, max_odds))
 
-    # Insights de % de acierto historico (best-effort, solo si hay
-    # balldontlie configurado y es un deporte soportado por ahora).
+    # Insights de % de acierto historico (best-effort, solo beisbol por ahora).
     if event_id and sport_key == "beisbol":
         try:
             await _enrich_events_with_player_insights(sport_key, results)
         except Exception:
             pass
+
+    # Filtro Over/Under: si el outcome se llama literalmente "Over"/"Under"
+    # (mercados de totales o de jugador), respeta la eleccion. Cualquier
+    # otro outcome (nombre de equipo, "Yes"/"No" de BTTS, etc.) no se toca.
+    def _passes_over_under(outcome: dict) -> bool:
+        if over_under_norm == "both":
+            return True
+        name = (outcome.get("name") or "").lower()
+        if name not in ("over", "under"):
+            return True
+        return name == over_under_norm
+
+    # Filtro de % minimo de acierto: solo aplica a outcomes que SI tienen
+    # insights calculados (por ahora, props de beisbol). Si no hay insights
+    # para ese outcome (no lo pudimos calcular, u otro deporte/mercado),
+    # se deja pasar tal cual -- no podemos juzgarlo sin el dato.
+    def _passes_min_hit_pct(outcome: dict) -> bool:
+        if min_hit_pct is None:
+            return True
+        insights = outcome.get("insights")
+        if not insights:
+            return True
+        pct = best_pct(insights)
+        if pct is None:
+            return True
+        return pct >= min_hit_pct
+
+    cleaned_events = []
+    for event in results:
+        cleaned_markets = []
+        for market in event.get("markets", []):
+            kept_outcomes = [
+                o for o in market.get("outcomes", []) if _passes_over_under(o) and _passes_min_hit_pct(o)
+            ]
+            if kept_outcomes:
+                cleaned_markets.append({**market, "outcomes": kept_outcomes})
+        if cleaned_markets:
+            cleaned_events.append({**event, "markets": cleaned_markets})
+    results = cleaned_events
 
     return {
         "filters": {
@@ -396,6 +441,8 @@ async def get_odds(
             "max_odds": max_odds,
             "markets": markets,
             "regions": effective_regions,
+            "min_hit_pct": min_hit_pct,
+            "over_under": over_under_norm,
         },
         "quota": quota_info,
         "count": len(results),
