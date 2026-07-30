@@ -2,60 +2,75 @@ def _covers_line(value: float, line: float, over: bool) -> bool:
     return value > line if over else value < line
 
 
-def hit_rate_from_values(values: list, line: float, over: bool) -> dict | None:
+def hit_rate_from_bools(bools: list) -> dict | None:
     """
-    Calcula cuantas veces (de una lista de valores historicos) se hubiera
-    cumplido la linea. Devuelve None si hay menos de 2 partidos (no es un
-    porcentaje confiable de mostrar).
+    A partir de una lista de True/False (cada uno = "esto se cumplio en
+    ese partido"), calcula hits/total/pct. None si hay menos de 2 datos
+    (no es un porcentaje confiable de mostrar).
     """
-    if len(values) < 2:
+    if len(bools) < 2:
         return None
-    hits = sum(1 for v in values if _covers_line(v, line, over))
-    total = len(values)
+    hits = sum(1 for b in bools if b)
+    total = len(bools)
     return {"hits": hits, "total": total, "pct": round(hits / total * 100)}
 
 
-def build_player_insights(entries: list, line: float, over: bool, opponent_id, last_n_vs_opponent: int = 10) -> dict:
+def _build_insight_lines(entries: list, hit_fn, opponent_id, label_suffix: str = "") -> list:
     """
-    Recibe una lista NORMALIZADA de partidos (mas reciente primero), cada
-    uno como {"value":..., "opponent_id":..., "is_home":...}. Independiente
-    de si vienen de balldontlie, MLB Stats API, etc. -- esa conversion la
-    hace cada cliente de datos por separado.
-
-    Arma 3 recortes fijos:
-      - last5: ultimos 5 partidos
-      - last10: ultimos 10 partidos
-      - vs_opponent: enfrentamientos recientes contra ese rival puntual
+    entries: lista de partidos/registros (mas reciente primero).
+    hit_fn: funcion que recibe una entry y devuelve True/False.
+    Arma hasta 3 lineas: ultimos 5, ultimos 10, vs rival puntual.
+    label_suffix: texto opcional para distinguir de que equipo/jugador es
+    (util cuando se combinan 2 perspectivas, ej en el mercado de totales).
     """
-    result = {}
+    lines = []
 
-    last5 = hit_rate_from_values([e["value"] for e in entries[:5]], line, over)
-    if last5:
-        result["last5"] = {**last5, "label": "Ultimos 5 partidos"}
+    r5 = hit_rate_from_bools([hit_fn(e) for e in entries[:5]])
+    if r5:
+        lines.append({**r5, "label": f"Ultimos 5 partidos{label_suffix}"})
 
-    last10 = hit_rate_from_values([e["value"] for e in entries[:10]], line, over)
-    if last10:
-        result["last10"] = {**last10, "label": "Ultimos 10 partidos"}
+    r10 = hit_rate_from_bools([hit_fn(e) for e in entries[:10]])
+    if r10:
+        lines.append({**r10, "label": f"Ultimos 10 partidos{label_suffix}"})
 
     if opponent_id is not None:
-        vs_opp_values = [e["value"] for e in entries if e.get("opponent_id") == opponent_id][:last_n_vs_opponent]
-        vs_opp = hit_rate_from_values(vs_opp_values, line, over)
-        if vs_opp:
-            result["vs_opponent"] = {**vs_opp, "label": f"Ultimos {vs_opp['total']} vs este rival"}
+        vs_entries = [e for e in entries if e.get("opponent_id") == opponent_id][:10]
+        rvs = hit_rate_from_bools([hit_fn(e) for e in vs_entries])
+        if rvs:
+            lines.append({**rvs, "label": f"Ultimos {rvs['total']} vs este rival{label_suffix}"})
 
-    return result
+    return lines
 
 
-def best_pct(insights: dict) -> float | None:
+def build_player_insights(entries: list, line: float, over: bool, opponent_id) -> list:
+    """Mercados de jugador (props): entries traen {"value":...}."""
+    return _build_insight_lines(entries, lambda e: _covers_line(e["value"], line, over), opponent_id)
+
+
+def build_team_h2h_insights(games: list, opponent_id) -> list:
+    """Mercado ganador (h2h): hit = el equipo gano ese partido."""
+    return _build_insight_lines(games, lambda g: g["team_score"] > g["opp_score"], opponent_id)
+
+
+def build_team_spread_insights(games: list, point: float, opponent_id) -> list:
     """
-    Devuelve el % mas representativo para aplicar el filtro de "% minimo
-    de acierto" -- usamos last10 si existe (mas muestra), si no last5.
-    vs_opponent no se usa para el filtro principal porque suele tener
-    muestra chica (a veces 2-3 partidos) y no queremos ocultar algo solo
-    por ese numero mas ruidoso.
+    Mercado handicap: hit = el equipo cubrio la linea. Formula estandar:
+    cubre si (marcador_equipo - marcador_rival) > -point (funciona para
+    favoritos con point negativo y para no-favoritos con point positivo).
     """
-    if "last10" in insights:
-        return insights["last10"]["pct"]
-    if "last5" in insights:
-        return insights["last5"]["pct"]
-    return None
+    return _build_insight_lines(games, lambda g: (g["team_score"] - g["opp_score"]) > -point, opponent_id)
+
+
+def build_team_total_insights(games: list, point: float, over: bool, opponent_id, label_suffix: str = "") -> list:
+    """Mercado totales: hit = el total combinado de ESE partido paso la linea."""
+    return _build_insight_lines(
+        games, lambda g: _covers_line(g["team_score"] + g["opp_score"], point, over), opponent_id, label_suffix
+    )
+
+
+def best_pct(insight_lines: list) -> float | None:
+    """El % mas alto entre todas las lineas calculadas (se usa tanto para
+    el filtro de % minimo como para decidir si se marca como VALOR)."""
+    if not insight_lines:
+        return None
+    return max(line["pct"] for line in insight_lines)

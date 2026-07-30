@@ -17,8 +17,14 @@ from config import (
     SPORT_GROUPS,
 )
 from odds_client import odds_api_get
-from mlb_stats_client import find_mlb_player_id, find_mlb_team_id, get_player_game_log
-from insights import best_pct, build_player_insights
+from mlb_stats_client import find_mlb_player_id, find_mlb_team_id, get_player_game_log, get_team_recent_games
+from insights import (
+    best_pct,
+    build_player_insights,
+    build_team_h2h_insights,
+    build_team_spread_insights,
+    build_team_total_insights,
+)
 
 # Colombia no tiene horario de verano, siempre UTC-5. Se usa para decidir
 # que partido cuenta como "de hoy" al filtrar eventos.
@@ -255,13 +261,14 @@ def _aggregate_and_filter_outcomes(odds_response: list, min_odds: float, max_odd
     return filtered_events
 
 
-async def _enrich_events_with_player_insights(sport_key: str, events: list) -> None:
+async def _enrich_events_with_insights(sport_key: str, events: list) -> None:
     """
-    Le agrega a cada outcome de mercado de jugador un campo "insights" con
-    el % de acierto historico. Por ahora solo beisbol (MLB Stats API,
-    gratis y oficial). Modifica 'events' in-place. Si algo falla (jugador
-    no encontrado, etc.) simplemente no agrega insights a ese outcome --
-    nunca rompe la respuesta principal.
+    Le agrega a cada outcome un campo "insights" (lista de lineas de %
+    de acierto historico) usando la MLB Stats API. Cubre los 4 tipos de
+    mercado: ganador (h2h), handicap (spreads), totales, y props de
+    jugador. Por ahora solo beisbol. Modifica 'events' in-place.
+    Si algo falla puntualmente (jugador/equipo no encontrado, etc.)
+    simplemente no agrega insights ahi -- nunca rompe la respuesta principal.
     """
     if sport_key != "beisbol":
         return
@@ -273,42 +280,94 @@ async def _enrich_events_with_player_insights(sport_key: str, events: list) -> N
         home_team_id = await find_mlb_team_id(event.get("home_team", ""))
         away_team_id = await find_mlb_team_id(event.get("away_team", ""))
 
+        # Cache local: no pedir el calendario del mismo equipo mas de una vez
+        # por evento, aunque se use en varios mercados (h2h, spreads, totales).
+        team_games_cache: dict[int, list] = {}
+
+        async def team_games(team_id: int) -> list:
+            if team_id not in team_games_cache:
+                team_games_cache[team_id] = await get_team_recent_games(team_id, seasons)
+            return team_games_cache[team_id]
+
         for market in event.get("markets", []):
-            stat_config = MLB_MARKET_STAT_FIELDS.get(market["key"])
-            if not stat_config:
-                continue
-            group, stat_field = stat_config
+            market_key = market["key"]
 
             for outcome in market.get("outcomes", []):
-                player_name = outcome.get("player")
-                point = outcome.get("point")
-                if not player_name or point is None:
-                    continue
-
                 try:
-                    # Buscamos primero en el roster del equipo de casa, luego el de visita
-                    player_id = None
-                    player_team_id = None
-                    if home_team_id:
-                        player_id = await find_mlb_player_id(home_team_id, player_name)
-                        if player_id:
-                            player_team_id = home_team_id
-                    if not player_id and away_team_id:
-                        player_id = await find_mlb_player_id(away_team_id, player_name)
-                        if player_id:
-                            player_team_id = away_team_id
-                    if not player_id:
-                        continue
+                    insights = None
 
-                    opponent_id = away_team_id if player_team_id == home_team_id else home_team_id
-                    log = await get_player_game_log(player_id, group, seasons, stat_field)
-                    over = outcome.get("name") == "Over"
-                    insights = build_player_insights(log, point, over, opponent_id)
+                    if market_key == "h2h" and home_team_id and away_team_id:
+                        if outcome.get("name") == event.get("home_team"):
+                            team_id, opponent_id = home_team_id, away_team_id
+                        elif outcome.get("name") == event.get("away_team"):
+                            team_id, opponent_id = away_team_id, home_team_id
+                        else:
+                            continue
+                        games = await team_games(team_id)
+                        insights = build_team_h2h_insights(games, opponent_id)
+
+                    elif market_key == "spreads" and home_team_id and away_team_id:
+                        point = outcome.get("point")
+                        if point is None:
+                            continue
+                        if outcome.get("name") == event.get("home_team"):
+                            team_id, opponent_id = home_team_id, away_team_id
+                        elif outcome.get("name") == event.get("away_team"):
+                            team_id, opponent_id = away_team_id, home_team_id
+                        else:
+                            continue
+                        games = await team_games(team_id)
+                        insights = build_team_spread_insights(games, point, opponent_id)
+
+                    elif market_key == "totals" and home_team_id and away_team_id:
+                        point = outcome.get("point")
+                        if point is None or outcome.get("name") not in ("Over", "Under"):
+                            continue
+                        over = outcome.get("name") == "Over"
+                        home_games = await team_games(home_team_id)
+                        away_games = await team_games(away_team_id)
+                        home_label = f" ({event.get('home_team', '').split(' ')[-1]})"
+                        away_label = f" ({event.get('away_team', '').split(' ')[-1]})"
+                        insights = build_team_total_insights(
+                            home_games, point, over, away_team_id, home_label
+                        ) + build_team_total_insights(away_games, point, over, home_team_id, away_label)
+
+                    else:
+                        stat_config = MLB_MARKET_STAT_FIELDS.get(market_key)
+                        player_name = outcome.get("player")
+                        point = outcome.get("point")
+                        if not stat_config or not player_name or point is None:
+                            continue
+                        group, stat_field = stat_config
+
+                        player_id = None
+                        player_team_id = None
+                        if home_team_id:
+                            player_id = await find_mlb_player_id(home_team_id, player_name)
+                            if player_id:
+                                player_team_id = home_team_id
+                        if not player_id and away_team_id:
+                            player_id = await find_mlb_player_id(away_team_id, player_name)
+                            if player_id:
+                                player_team_id = away_team_id
+                        if not player_id:
+                            continue
+
+                        opponent_id = away_team_id if player_team_id == home_team_id else home_team_id
+                        log = await get_player_game_log(player_id, group, seasons, stat_field)
+                        over = outcome.get("name") == "Over"
+                        insights = build_player_insights(log, point, over, opponent_id)
+
                     if insights:
                         outcome["insights"] = insights
+                        # VALOR tambien se enciende si algun insight esta al 100%,
+                        # ademas de la señal de cuota-por-encima-del-promedio que
+                        # ya se calculaba antes.
+                        if best_pct(insights) is not None and best_pct(insights) >= 100:
+                            outcome["is_value"] = True
                 except Exception:
-                    # Best-effort: si la MLB Stats API falla para este jugador puntual,
-                    # seguimos con el resto sin tumbar toda la respuesta.
+                    # Best-effort: si la MLB Stats API falla para este outcome
+                    # puntual, seguimos con el resto sin tumbar la respuesta.
                     continue
 
 
@@ -389,7 +448,7 @@ async def get_odds(
     # Insights de % de acierto historico (best-effort, solo beisbol por ahora).
     if event_id and sport_key == "beisbol":
         try:
-            await _enrich_events_with_player_insights(sport_key, results)
+            await _enrich_events_with_insights(sport_key, results)
         except Exception:
             pass
 

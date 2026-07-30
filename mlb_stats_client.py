@@ -101,3 +101,55 @@ async def get_player_game_log(player_id: int, group: str, seasons: list[int], st
 
     entries.sort(key=lambda e: e["date"], reverse=True)
     return entries
+
+
+async def get_team_recent_games(team_id: int, seasons: list[int]) -> list[dict]:
+    """
+    Trae partidos ya jugados (con marcador final) de un equipo, mas
+    reciente primero. Cada entry normalizada: {"team_score", "opp_score",
+    "opponent_id", "is_home", "date"}. Se usa para calcular insights de
+    ganador, handicap y totales.
+    """
+    entries = []
+    for season in seasons:
+        data = await mlb_get(
+            "/schedule",
+            {"sportId": 1, "teamId": team_id, "season": season, "gameType": "R"},
+        )
+        if not data or not data.get("dates"):
+            continue
+
+        for date_block in data["dates"]:
+            for game in date_block.get("games", []):
+                status = (game.get("status") or {}).get("detailedState")
+                if status != "Final":
+                    continue
+
+                teams = game.get("teams", {})
+                home = teams.get("home", {})
+                away = teams.get("away", {})
+
+                if (home.get("team") or {}).get("id") == team_id:
+                    team_side, opp_side, is_home = home, away, True
+                elif (away.get("team") or {}).get("id") == team_id:
+                    team_side, opp_side, is_home = away, home, False
+                else:
+                    continue
+
+                team_score = team_side.get("score")
+                opp_score = opp_side.get("score")
+                if team_score is None or opp_score is None:
+                    continue
+
+                entries.append(
+                    {
+                        "team_score": team_score,
+                        "opp_score": opp_score,
+                        "opponent_id": (opp_side.get("team") or {}).get("id"),
+                        "is_home": is_home,
+                        "date": date_block.get("date", ""),
+                    }
+                )
+
+    entries.sort(key=lambda e: e["date"], reverse=True)
+    return entries
